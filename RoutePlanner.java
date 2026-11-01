@@ -78,6 +78,9 @@ public class RoutePlanner {
     // Result and statistics of a search
     public static class SearchResult {
         public List<String> pathDetails = new ArrayList<>();
+        public List<String> pathStates = new ArrayList<>(); // states of the solution, START..GOAL
+        public List<String> pathActions = new ArrayList<>(); // action leading into each state
+        public Set<String> expandedStates = new HashSet<>(); // for the SVG visualization
         public double totalTimeMinutes = 0.0;
         public int exploredStatesCount = 0;
         public int maxQueueSize = 0;
@@ -263,6 +266,7 @@ public class RoutePlanner {
 
             // Count expanded states (including the goal node)
             result.exploredStatesCount++;
+            result.expandedStates.add(current.state);
             if (verbose) {
                 System.out.printf(Locale.US, "  [%d] f=%.2f g=%.2f depth=%d  %s%n",
                         result.exploredStatesCount, current.fCost, current.gCost, current.depth, formatPath(current));
@@ -378,6 +382,10 @@ public class RoutePlanner {
             chain.add(0, trace);
             trace = trace.parent;
         }
+        for (SearchNode node : chain) {
+            result.pathStates.add(node.state);
+            result.pathActions.add(node.actionTaken);
+        }
 
         for (int i = 1; i < chain.size(); i++) {
             SearchNode fromNode = chain.get(i - 1);
@@ -424,10 +432,11 @@ public class RoutePlanner {
     }
 
     private static void printUsage() {
-        System.out.println("Usage: java RoutePlanner [-v] [--compare] [startLat startLon destLat destLon [p_max] [timeoutSec]]");
+        System.out.println("Usage: java RoutePlanner [-v] [--compare] [--svg file] [startLat startLon destLat destLon [p_max] [timeoutSec]]");
         System.out.println("Without coordinates the demo scenarios A-F are run.");
-        System.out.println("-v:        print every expanded path with f, g and depth");
-        System.out.println("--compare: compare A* against uniform-cost search (h = 0)");
+        System.out.println("-v:         print every expanded path with f, g and depth");
+        System.out.println("--compare:  compare A* against uniform-cost search (h = 0)");
+        System.out.println("--svg file: draw the states expanded by A* and UCS on a map");
     }
 
     // Runs one scenario and prints the result
@@ -468,6 +477,187 @@ public class RoutePlanner {
                 new Coordinate(52.5383, 13.6339), new Coordinate(52.535, 13.200278));
     }
 
+    // Official BVG line colors
+    private static final Map<String, String> LINE_COLORS = new HashMap<>();
+    static {
+        LINE_COLORS.put("U1", "#7DAD4C");
+        LINE_COLORS.put("U2", "#DA421E");
+        LINE_COLORS.put("U3", "#16683D");
+        LINE_COLORS.put("U4", "#F0D722");
+        LINE_COLORS.put("U5", "#7E5330");
+        LINE_COLORS.put("U6", "#8C6DAB");
+        LINE_COLORS.put("U7", "#528DBA");
+        LINE_COLORS.put("U8", "#224F86");
+        LINE_COLORS.put("U9", "#F3791D");
+    }
+
+    private static final double PANEL_WIDTH = 480;
+    private static final double PANEL_GAP = 20;
+    private static final double PANEL_TOP = 64;
+    private static final String EXPANDED_COLOR = "#E8590C";
+
+    // Maps geo coordinates onto one SVG panel (equirectangular, longitude scaled by cos(lat))
+    private static class Projection {
+        final double minLon, maxLat, lonFactor, scale, offsetX, offsetY;
+
+        Projection(double minLon, double maxLat, double lonFactor, double scale, double offsetX, double offsetY) {
+            this.minLon = minLon;
+            this.maxLat = maxLat;
+            this.lonFactor = lonFactor;
+            this.scale = scale;
+            this.offsetX = offsetX;
+            this.offsetY = offsetY;
+        }
+
+        double x(Coordinate c) { return offsetX + (c.lon - minLon) * lonFactor * scale; }
+        double y(Coordinate c) { return offsetY + (maxLat - c.lat) * scale; }
+    }
+
+    private Coordinate locate(String state, Coordinate start, Coordinate target) {
+        if (state.equals("START")) return start;
+        if (state.equals("GOAL")) return target;
+        return nodeLocations.get(state);
+    }
+
+    // Writes an SVG that shows the states expanded by A* next to those expanded by uniform-cost search
+    private void writeComparisonSvg(Path outFile, Coordinate start, Coordinate target, String routeName) throws IOException {
+        useHeuristic = true;
+        SearchResult aStar = findRoute(start, target, DEFAULT_P_MAX, DEFAULT_TIMEOUT_S, MAX_WALK_TO_STATION_MIN, MAX_DIRECT_WALK_MIN);
+        useHeuristic = false;
+        SearchResult ucs = findRoute(start, target, DEFAULT_P_MAX, DEFAULT_TIMEOUT_S, MAX_WALK_TO_STATION_MIN, MAX_DIRECT_WALK_MIN);
+        useHeuristic = true;
+
+        // Bounding box of the network plus start and destination
+        List<Coordinate> all = new ArrayList<>(nodeLocations.values());
+        all.add(start);
+        all.add(target);
+        double minLat = Double.POSITIVE_INFINITY, maxLat = Double.NEGATIVE_INFINITY;
+        double minLon = Double.POSITIVE_INFINITY, maxLon = Double.NEGATIVE_INFINITY;
+        for (Coordinate c : all) {
+            minLat = Math.min(minLat, c.lat);
+            maxLat = Math.max(maxLat, c.lat);
+            minLon = Math.min(minLon, c.lon);
+            maxLon = Math.max(maxLon, c.lon);
+        }
+        double lonFactor = Math.cos(Math.toRadians((minLat + maxLat) / 2));
+        double inner = PANEL_WIDTH - 2 * PANEL_GAP;
+        double scale = inner / ((maxLon - minLon) * lonFactor);
+        double panelHeight = (maxLat - minLat) * scale + 2 * PANEL_GAP;
+        double width = 2 * PANEL_WIDTH + 3 * PANEL_GAP;
+        double height = PANEL_TOP + panelHeight + 56;
+
+        StringBuilder svg = new StringBuilder();
+        svg.append(String.format(Locale.US,
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"%.0f\" height=\"%.0f\" viewBox=\"0 0 %.0f %.0f\" "
+                        + "font-family=\"Helvetica, Arial, sans-serif\">%n", width, height, width, height));
+        svg.append(String.format(Locale.US, "<rect width=\"%.0f\" height=\"%.0f\" fill=\"#ffffff\"/>%n", width, height));
+        svg.append(String.format(Locale.US,
+                "<text x=\"%.0f\" y=\"26\" font-size=\"17\" font-weight=\"bold\" fill=\"#222\">%s</text>%n",
+                PANEL_GAP, escapeXml(routeName)));
+
+        String[] titles = {
+                String.format(Locale.US, "A* with straight-line heuristic: %d states expanded", aStar.exploredStatesCount),
+                String.format(Locale.US, "Uniform-cost search (h = 0): %d states expanded", ucs.exploredStatesCount)
+        };
+        SearchResult[] results = {aStar, ucs};
+        for (int i = 0; i < 2; i++) {
+            double panelX = PANEL_GAP + i * (PANEL_WIDTH + PANEL_GAP);
+            Projection proj = new Projection(minLon, maxLat, lonFactor, scale, panelX + PANEL_GAP, PANEL_TOP + PANEL_GAP);
+            svg.append(String.format(Locale.US,
+                    "<text x=\"%.0f\" y=\"%.0f\" font-size=\"13\" fill=\"#444\">%s</text>%n",
+                    panelX, PANEL_TOP - 10, escapeXml(titles[i])));
+            svg.append(String.format(Locale.US,
+                    "<rect x=\"%.0f\" y=\"%.0f\" width=\"%.0f\" height=\"%.0f\" rx=\"8\" fill=\"#f7f7f5\" stroke=\"#e2e2de\"/>%n",
+                    panelX, PANEL_TOP, PANEL_WIDTH, panelHeight));
+            appendPanel(svg, proj, results[i], start, target);
+        }
+
+        // Legend
+        double ly = PANEL_TOP + panelHeight + 30;
+        double lx = PANEL_GAP;
+        svg.append(String.format(Locale.US,
+                "<line x1=\"%.0f\" y1=\"%.0f\" x2=\"%.0f\" y2=\"%.0f\" stroke=\"#111\" stroke-width=\"4\"/>%n", lx, ly, lx + 26, ly));
+        svg.append(legendText(lx + 34, ly, String.format(Locale.US, "optimal route (%.1f min)", aStar.totalTimeMinutes)));
+        lx += 210;
+        svg.append(String.format(Locale.US,
+                "<line x1=\"%.0f\" y1=\"%.0f\" x2=\"%.0f\" y2=\"%.0f\" stroke=\"#111\" stroke-width=\"2.5\" stroke-dasharray=\"4 3\"/>%n",
+                lx, ly, lx + 26, ly));
+        svg.append(legendText(lx + 34, ly, "walking"));
+        lx += 110;
+        svg.append(String.format(Locale.US, "<circle cx=\"%.0f\" cy=\"%.0f\" r=\"4.5\" fill=\"%s\"/>%n", lx + 5, ly, EXPANDED_COLOR));
+        svg.append(legendText(lx + 16, ly, "expanded by the search"));
+        lx += 190;
+        svg.append(String.format(Locale.US, "<circle cx=\"%.0f\" cy=\"%.0f\" r=\"2.5\" fill=\"#b9b9b4\"/>%n", lx + 5, ly));
+        svg.append(legendText(lx + 16, ly, "never touched"));
+        lx += 130;
+        svg.append(String.format(Locale.US,
+                "<circle cx=\"%.0f\" cy=\"%.0f\" r=\"5\" fill=\"#fff\" stroke=\"#111\" stroke-width=\"2.5\"/>%n", lx + 5, ly));
+        svg.append(legendText(lx + 16, ly, "start / destination"));
+        svg.append("</svg>\n");
+
+        Files.write(outFile, svg.toString().getBytes(StandardCharsets.UTF_8));
+        System.out.printf(Locale.US, "SVG written to %s (A*: %d, UCS: %d expanded states)%n",
+                outFile, aStar.exploredStatesCount, ucs.exploredStatesCount);
+    }
+
+    private static String legendText(double x, double y, String text) {
+        return String.format(Locale.US, "<text x=\"%.0f\" y=\"%.0f\" font-size=\"12\" fill=\"#444\">%s</text>%n",
+                x, y + 4, escapeXml(text));
+    }
+
+    private static String escapeXml(String text) {
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+    }
+
+    // Draws the network, the expanded stations and the solution of one search into a panel
+    private void appendPanel(StringBuilder svg, Projection proj, SearchResult result, Coordinate start, Coordinate target) {
+        // U-Bahn lines in their colors (each edge appears twice in the data, draw it once)
+        for (Map.Entry<String, List<Connection>> entry : networkGraph.entrySet()) {
+            String from = entry.getKey();
+            for (Connection edge : entry.getValue()) {
+                if (!edge.actionType.equals("travel") || from.compareTo(edge.target) > 0) continue;
+                Coordinate a = nodeLocations.get(from);
+                Coordinate b = nodeLocations.get(edge.target);
+                String color = LINE_COLORS.getOrDefault(from.substring(0, from.indexOf(':')), "#999999");
+                svg.append(String.format(Locale.US,
+                        "<line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" stroke=\"%s\" stroke-width=\"2.5\" "
+                                + "stroke-opacity=\"0.45\" stroke-linecap=\"round\"/>%n",
+                        proj.x(a), proj.y(a), proj.x(b), proj.y(b), color));
+            }
+        }
+        // Stations: small grey dots, expanded ones highlighted
+        for (Map.Entry<String, Coordinate> entry : nodeLocations.entrySet()) {
+            if (result.expandedStates.contains(entry.getKey())) continue;
+            svg.append(String.format(Locale.US, "<circle cx=\"%.1f\" cy=\"%.1f\" r=\"2\" fill=\"#b9b9b4\"/>%n",
+                    proj.x(entry.getValue()), proj.y(entry.getValue())));
+        }
+        for (String state : result.expandedStates) {
+            Coordinate c = nodeLocations.get(state);
+            if (c == null) continue;
+            svg.append(String.format(Locale.US, "<circle cx=\"%.1f\" cy=\"%.1f\" r=\"4\" fill=\"%s\" fill-opacity=\"0.85\"/>%n",
+                    proj.x(c), proj.y(c), EXPANDED_COLOR));
+        }
+        // Solution path: white casing below, walking dashed
+        for (int pass = 0; pass < 2; pass++) {
+            for (int i = 1; i < result.pathStates.size(); i++) {
+                Coordinate a = locate(result.pathStates.get(i - 1), start, target);
+                Coordinate b = locate(result.pathStates.get(i), start, target);
+                boolean walk = result.pathActions.get(i).startsWith("walk");
+                String style = pass == 0
+                        ? "stroke=\"#ffffff\" stroke-width=\"7\""
+                        : "stroke=\"#111111\" stroke-width=\"" + (walk ? "2.5\" stroke-dasharray=\"4 3\"" : "4\"");
+                svg.append(String.format(Locale.US,
+                        "<line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" %s stroke-linecap=\"round\"/>%n",
+                        proj.x(a), proj.y(a), proj.x(b), proj.y(b), style));
+            }
+        }
+        for (Coordinate c : new Coordinate[]{start, target}) {
+            svg.append(String.format(Locale.US,
+                    "<circle cx=\"%.1f\" cy=\"%.1f\" r=\"6\" fill=\"#ffffff\" stroke=\"#111111\" stroke-width=\"2.5\"/>%n",
+                    proj.x(c), proj.y(c)));
+        }
+    }
+
     public static void main(String[] args) {
         try {
             // Umlauts: use the console code page on Windows, UTF-8 otherwise
@@ -485,10 +675,31 @@ public class RoutePlanner {
             List<String> argList = new ArrayList<>(Arrays.asList(args));
             planner.verbose = argList.remove("-v");
             boolean compare = argList.remove("--compare");
+            String svgFile = null;
+            int svgIndex = argList.indexOf("--svg");
+            if (svgIndex >= 0 && svgIndex + 1 < argList.size()) {
+                svgFile = argList.remove(svgIndex + 1);
+                argList.remove(svgIndex);
+            }
             args = argList.toArray(new String[0]);
 
             if (compare) {
                 planner.runComparison();
+                return;
+            }
+
+            // SVG of A* vs. UCS, for the given coordinates or Rathaus Spandau -> Rudow
+            if (svgFile != null) {
+                if (args.length == 4) {
+                    planner.writeComparisonSvg(Paths.get(svgFile),
+                            new Coordinate(parseDecimal(args[0]), parseDecimal(args[1])),
+                            new Coordinate(parseDecimal(args[2]), parseDecimal(args[3])),
+                            "A* vs. uniform-cost search");
+                } else {
+                    planner.writeComparisonSvg(Paths.get(svgFile),
+                            new Coordinate(52.5350, 13.2003), new Coordinate(52.4158, 13.4961),
+                            "Rathaus Spandau → Rudow: A* vs. uniform-cost search");
+                }
                 return;
             }
 
