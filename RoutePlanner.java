@@ -9,22 +9,24 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
 
-public class Routenplaner {
+public class RoutePlanner {
 
-    private static final double WALK_SPEED_KMH = 5.0; // Das Tempo zu Fuss betraegt: 5 km/h
-    private static final double EARTH_RADIUS_KM = 6371.0088; //Erdradius für die Abstand berechnung in km
-    private static final double EPSILON = 1e-9; //verhindert Rundungsfehler
+    private static final double WALK_SPEED_KMH = 5.0; // walking speed: 5 km/h
+    private static final double EARTH_RADIUS_KM = 6371.0088; // mean earth radius for distance calculation
+    private static final double EPSILON = 1e-9; // tolerance for floating point comparisons
 
-    // Standardwerte der Suche
-    // p_max: laengste optimale Route im Netz hat 47 Aktionen
+    // Default search parameters
+    // p_max: the longest optimal route in the network has 47 actions
     public static final int DEFAULT_P_MAX = 50;
     public static final double DEFAULT_TIMEOUT_S = 10.0;
-    public static final double MAX_WALK_TO_STATION_MIN = 15.0; //max. Fussweg Start->Station bzw. Station->Ziel
-    // max. Fussweg Start->Ziel ohne U-Bahn (2 x 15 Min.)
+    public static final double MAX_WALK_TO_STATION_MIN = 15.0; // max. walk start->station and station->destination
+    // max. walk start->destination without the U-Bahn (2 x 15 min)
     public static final double MAX_DIRECT_WALK_MIN = 2 * MAX_WALK_TO_STATION_MIN;
-    public static final int FALLBACK_STATIONS = 2; //naechste Stationen, falls keine im Umkreis liegt
+    public static final int FALLBACK_STATIONS = 2; // nearest stations used when none is within walking range
 
-    public static class Coordinate { //speichert die Geokoordinaten von Orten und Stationen
+    private static final String DATA_FILE = "berlin_ubahn_network.csv";
+
+    public static class Coordinate { // geographic position of a place or station
         final double lat;
         final double lon;
 
@@ -34,7 +36,7 @@ public class Routenplaner {
         }
     }
 
-    public static class Connection { //Eine Kante im Graphen
+    public static class Connection { // an edge in the graph
         final String target;
         final double duration;
         final String actionType;
@@ -45,7 +47,7 @@ public class Routenplaner {
             this.actionType = actionType;
         }
     }
-    //Ein Schritt für die A*-Suche
+    // A node in the A* search tree
     public static class SearchNode implements Comparable<SearchNode> {
         final String state;
         final double gCost;
@@ -64,7 +66,7 @@ public class Routenplaner {
             this.stepCost = stepCost;
             this.depth = depth;
         }
-        //Sortiert nach den geringsten Kosten(f=g+h)
+        // Order by lowest f = g + h, ties broken by lower g
         @Override
         public int compareTo(SearchNode other) {
             if (Math.abs(this.fCost - other.fCost) > EPSILON) {
@@ -73,7 +75,7 @@ public class Routenplaner {
             return Double.compare(this.gCost, other.gCost);
         }
     }
-    //Speichert das Ergebnis und die Statistik der Suche
+    // Result and statistics of a search
     public static class SearchResult {
         public List<String> pathDetails = new ArrayList<>();
         public double totalTimeMinutes = 0.0;
@@ -81,30 +83,31 @@ public class Routenplaner {
         public int maxQueueSize = 0;
         public boolean hitDepthLimit = false;
         public boolean hitTimeLimit = false;
-        public boolean startFallback = false; //keine Station im Umkreis des Starts
-        public boolean targetFallback = false; //keine Station im Umkreis des Ziels
+        public boolean startFallback = false; // no station within walking range of the start
+        public boolean targetFallback = false; // no station within walking range of the destination
         public double maxWalkToStationMin;
         public String statusMessage = "";
         public Coordinate startCoord;
         public Coordinate targetCoord;
     }
-    //Der U-Bahn-Graph und die Koordinaten der Stationen
+    // The U-Bahn graph and station coordinates
     private final Map<String, List<Connection>> networkGraph = new HashMap<>();
     private final Map<String, Coordinate> nodeLocations = new HashMap<>();
     private double maximumMetroSpeed = WALK_SPEED_KMH;
-    private boolean verbose = false; //-v: jeden untersuchten Pfad ausgeben
-    //erstellt den Planer und laedt die CSV Daten
-    public Routenplaner(Path csvFilePath) throws IOException {
+    private boolean verbose = false; // -v: print every expanded path
+    private boolean useHeuristic = true; // false: h = 0, i.e. uniform-cost search
+    // Creates the planner and loads the network from the CSV file
+    public RoutePlanner(Path csvFilePath) throws IOException {
         loadNetwork(csvFilePath);
     }
-    //Liest alle Verbindungen und Stationen aus der CSv Datei
+    // Reads all connections and stations from the CSV file
     private void loadNetwork(Path csvFilePath) throws IOException {
         List<String> records = Files.readAllLines(csvFilePath, StandardCharsets.UTF_8);
 
         for (int i = 1; i < records.size(); i++) {
             String currentLine = records.get(i).trim();
             if (currentLine.isEmpty()) continue;
-            //Daten aus der CSV-zeile parsen
+            // Parse one CSV row
             String[] tokens = currentLine.split(";", -1);
             if (tokens.length < 10) continue;
 
@@ -114,12 +117,12 @@ public class Routenplaner {
             double duration = parseDecimal(tokens[3]);
             Coordinate originCoord = new Coordinate(parseDecimal(tokens[6]), parseDecimal(tokens[7]));
             Coordinate destCoord = new Coordinate(parseDecimal(tokens[8]), parseDecimal(tokens[9]));
-            //Koordinaten der Haltestellen speichern
+            // Remember station coordinates
             registerLocation(origin, originCoord);
             registerLocation(destination, destCoord);
-            //Die CSV enthaelt beide Fahrtrichtungen als eigene Zeilen
+            // The CSV lists both directions as separate rows
             addGraphEdge(origin, destination, duration, action);
-            //maximale Geschwindigkeit fuer die Heuristik
+            // Fastest speed in the network, used by the heuristic
             if (duration > 0) {
                 double distanceKm = calculateDistanceKm(originCoord, destCoord);
                 double speedKmH = (distanceKm / duration) * 60.0;
@@ -129,21 +132,21 @@ public class Routenplaner {
             }
         }
     }
-    //Fuegt eine Kante zum Graphen hin zu
+    // Adds a directed edge to the graph
     private void addGraphEdge(String from, String to, double cost, String action) {
         networkGraph.computeIfAbsent(from, k -> new ArrayList<>()).add(new Connection(to, cost, action));
     }
-    //Speichert die Koordinaten für einen Namen
+    // Stores the coordinates of a node
     private void registerLocation(String key, Coordinate coord) {
         if (!key.isEmpty()) {
             nodeLocations.putIfAbsent(key, coord);
         }
     }
-    //Ersetzt Komma durch Punkt
+    // Accepts both decimal comma and decimal point
     private static double parseDecimal(String rawValue) {
         return Double.parseDouble(rawValue.replace(',', '.').trim());
     }
-    //Berechnet die Distanz in km mit der Haversine-Formel
+    // Great-circle distance in km (haversine formula)
     public static double calculateDistanceKm(Coordinate p1, Coordinate p2) {
         double dLat = Math.toRadians(p2.lat - p1.lat);
         double dLon = Math.toRadians(p2.lon - p1.lon);
@@ -155,21 +158,21 @@ public class Routenplaner {
         double c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
         return EARTH_RADIUS_KM * c;
     }
-    //Berechnet die Gehzeit in Minuten bei 5 km/h
+    // Walking time in minutes at 5 km/h
     public static double calculateWalkMinutes(Coordinate p1, Coordinate p2) {
         return (calculateDistanceKm(p1, p2) / WALK_SPEED_KMH) * 60.0;
     }
-    //zulaessige Heuristik: Luftlinie / maximale Geschwindigkeit
+    // Admissible heuristic: straight-line distance / fastest speed in the network
     private double calculateHeuristic(Coordinate current, Coordinate destination) {
-        if (current == null || destination == null) return 0.0;
+        if (!useHeuristic || current == null || destination == null) return 0.0;
         double distKm = calculateDistanceKm(current, destination);
         return (distKm / maximumMetroSpeed) * 60.0;
     }
-    //Stationsname ohne Linie (U2:Alexanderplatz -> Alexanderplatz)
+    // Station name without line prefix (U2:Alexanderplatz -> Alexanderplatz)
     private static String stationName(String node) {
         return node.substring(node.indexOf(':') + 1);
     }
-    //Linienknoten in Gehweite
+    // Line nodes within walking range
     private Set<String> nodesInWalkingRange(Coordinate pos, double maxWalkMin) {
         Set<String> nodes = new HashSet<>();
         for (Map.Entry<String, Coordinate> entry : nodeLocations.entrySet()) {
@@ -179,7 +182,7 @@ public class Routenplaner {
         }
         return nodes;
     }
-    //Linienknoten der naechsten Stationen (Fallback)
+    // Line nodes of the nearest stations (fallback)
     private Set<String> nodesOfNearestStations(Coordinate pos, int count) {
         Map<String, Double> stationDistances = new HashMap<>();
         for (Map.Entry<String, Coordinate> entry : nodeLocations.entrySet()) {
@@ -197,28 +200,28 @@ public class Routenplaner {
         }
         return nodes;
     }
-    //Prueft, ob ein Zustand schon auf dem Pfad liegt (Zyklen)
+    // Checks whether a state is already on the path (cycle check)
     private static boolean isOnPath(SearchNode node, String state) {
         for (SearchNode trace = node; trace != null; trace = trace.parent) {
             if (trace.state.equals(state)) return true;
         }
         return false;
     }
-    //Prueft, ob auf dem Pfad U-Bahn gefahren wurde
+    // Checks whether the path contains at least one U-Bahn ride
     private static boolean hasTraveled(SearchNode node) {
         for (SearchNode trace = node; trace != null; trace = trace.parent) {
             if (trace.actionTaken.equals("travel")) return true;
         }
         return false;
     }
-    //A* Suche von Start Koordinate zu Zielkoordinate
+    // A* search from a start coordinate to a destination coordinate
     public SearchResult findRoute(Coordinate startPos, Coordinate targetPos, int maxDepth, double timeoutSeconds, double maxWalkToStationMin, double maxDirectWalkMin) {
         SearchResult result = new SearchResult();
         result.startCoord = startPos;
         result.targetCoord = targetPos;
         result.maxWalkToStationMin = maxWalkToStationMin;
 
-        // Stationen fuer den ersten und letzten Fussweg (sonst die naechsten)
+        // Stations for the first and last walk (otherwise the nearest ones)
         Set<String> startNodes = nodesInWalkingRange(startPos, maxWalkToStationMin);
         if (startNodes.isEmpty()) {
             result.startFallback = true;
@@ -235,38 +238,38 @@ public class Routenplaner {
 
         long startTimeNano = System.nanoTime();
 
-        // Startzustand initialisieren
+        // Initial state
         openList.add(new SearchNode("START", 0.0, calculateHeuristic(startPos, targetPos), null, "START", 0.0, 0));
         visitedBestCosts.put("START|0", 0.0);
         result.maxQueueSize = 1;
 
         SearchNode goalNode = null;
-        SearchNode bestGoalInOpen = null; //beste erzeugte Loesung, falls das Zeitlimit greift
+        SearchNode bestGoalInOpen = null; // best generated solution, used if the time limit is hit
 
         while (!openList.isEmpty()) {
             double elapsedSeconds = (System.nanoTime() - startTimeNano) / 1e9;
-            if (elapsedSeconds >= timeoutSeconds) { //Prüft das Zeitlimit
+            if (elapsedSeconds >= timeoutSeconds) { // time limit check
                 result.hitTimeLimit = true;
                 break;
             }
 
             SearchNode current = openList.poll();
 
-            // Veraltete Kopie ueberspringen
+            // Skip stale duplicates
             String stateDepthKey = current.state + "|" + current.depth;
             if (current.gCost > visitedBestCosts.getOrDefault(stateDepthKey, Double.POSITIVE_INFINITY) + EPSILON) {
                 continue;
             }
 
-            // Untersuchte Zustaende zaehlen (auch der Zielknoten)
+            // Count expanded states (including the goal node)
             result.exploredStatesCount++;
             if (verbose) {
                 System.out.printf(Locale.US, "  [%d] f=%.2f g=%.2f depth=%d  %s%n",
                         result.exploredStatesCount, current.fCost, current.gCost, current.depth, formatPath(current));
             }
 
-            // Ziel erreicht Abbruch mit optimaler Lösung
-            if (current.state.equals("ZIEL")) {
+            // Goal test on expansion guarantees an optimal solution
+            if (current.state.equals("GOAL")) {
                 goalNode = current;
                 break;
             }
@@ -274,25 +277,25 @@ public class Routenplaner {
             List<Connection> candidateActions = new ArrayList<>();
 
             if (current.state.equals("START")) {
-                // 1. Direkt zu Fuss zum Ziel gehen (im Fallback ohne Limit)
+                // 1. Walk directly to the destination (no limit in fallback mode)
                 double directWalk = calculateWalkMinutes(startPos, targetPos);
                 if (directWalk <= maxDirectWalkMin || result.startFallback || result.targetFallback) {
-                    candidateActions.add(new Connection("ZIEL", directWalk, "walk_direct"));
+                    candidateActions.add(new Connection("GOAL", directWalk, "walk_direct"));
                 }
-                // 2. Zu Fuss zu Stationen in der Naehe gehen
+                // 2. Walk to a nearby station
                 for (String node : startNodes) {
                     double walkDuration = calculateWalkMinutes(startPos, nodeLocations.get(node));
                     candidateActions.add(new Connection(node, walkDuration, "walk_start"));
                 }
             } else {
-                // U-Bahn-Fahrt und Umstieg
+                // Ride to the next station or transfer to another line
                 List<Connection> connections = networkGraph.getOrDefault(current.state, Collections.emptyList());
                 candidateActions.addAll(connections);
 
-                // Zu Fuss zum Zielort, erst nach mindestens einer Fahrt
+                // Walk to the destination, only after at least one ride
                 if (targetNodes.contains(current.state) && hasTraveled(current)) {
                     double walkToEnd = calculateWalkMinutes(nodeLocations.get(current.state), targetPos);
-                    candidateActions.add(new Connection("ZIEL", walkToEnd, "walk_end"));
+                    candidateActions.add(new Connection("GOAL", walkToEnd, "walk_end"));
                 }
             }
 
@@ -307,56 +310,56 @@ public class Routenplaner {
                 if (visitedBestCosts.getOrDefault(nextKey, Double.POSITIVE_INFINITY) <= newG + EPSILON) {
                     continue;
                 }
-                // Pfadlaengenlimit (p_max)
+                // Path length limit (p_max)
                 if (newDepth > maxDepth) {
                     result.hitDepthLimit = true;
                     continue;
                 }
                 visitedBestCosts.put(nextKey, newG);
-                //Heuristik und f-Kosten(g+h) für den Nachfolger berechnen
-                Coordinate nextCoord = edge.target.equals("ZIEL") ? targetPos : nodeLocations.get(edge.target);
+                // Heuristic and f-cost (g + h) of the successor
+                Coordinate nextCoord = edge.target.equals("GOAL") ? targetPos : nodeLocations.get(edge.target);
                 double hVal = calculateHeuristic(nextCoord, targetPos);
                 double newF = newG + hVal;
-                //Neuen Knoten erstellen und in OPEN einfügen
+                // Create the successor and push it onto OPEN
                 SearchNode nextNode = new SearchNode(edge.target, newG, newF, current, edge.actionType, edge.duration, newDepth);
                 openList.add(nextNode);
-                if (nextNode.state.equals("ZIEL") && (bestGoalInOpen == null || newG < bestGoalInOpen.gCost)) {
+                if (nextNode.state.equals("GOAL") && (bestGoalInOpen == null || newG < bestGoalInOpen.gCost)) {
                     bestGoalInOpen = nextNode;
                 }
             }
 
             result.maxQueueSize = Math.max(result.maxQueueSize, openList.size());
         }
-        //Bei Zeitlimit die beste bisher erzeugte Loesung liefern
+        // On timeout, return the best solution generated so far
         if (goalNode == null && result.hitTimeLimit) {
             goalNode = bestGoalInOpen;
         }
-        //Pfad rekonstruieren, falls Ziel erreicht wurde
+        // Reconstruct the path if the goal was reached
         if (goalNode != null) {
             result.totalTimeMinutes = goalNode.gCost;
             reconstructPath(goalNode, result);
-            //Statusmeldung gemaess Aufgabenstellung setzen
+            // Status depending on which limit was hit
             if (result.hitTimeLimit) {
-                result.statusMessage = "Zeitlimit erreicht – beste bisher gefundene Lösung (nicht garantiert optimal)";
+                result.statusMessage = "time limit reached - best solution found so far (not guaranteed optimal)";
             } else if (result.hitDepthLimit) {
-                result.statusMessage = "potenziell nicht optimale Lösung gefunden";
+                result.statusMessage = "potentially non-optimal solution found";
             } else {
-                result.statusMessage = "optimale Lösung gefunden";
+                result.statusMessage = "optimal solution found";
             }
         } else {
             if (result.hitTimeLimit) {
-                result.statusMessage = "Suche mit Zeitlimit ohne Erfolg";
+                result.statusMessage = "search did not succeed within the time limit";
             } else if (result.hitDepthLimit) {
-                result.statusMessage = "Lösung mit begrenztem Speicher nicht generierbar";
+                result.statusMessage = "no solution can be generated with limited memory";
             } else {
-                result.statusMessage = "Keine Route gefunden: Ziel ist von den erreichbaren Stationen aus nicht erreichbar";
+                result.statusMessage = "no route found: destination is not reachable from the available stations";
             }
         }
 
         return result;
     }
 
-    //Pfad als Text fuer die -v Ausgabe
+    // Path as text for the -v output
     private static String formatPath(SearchNode node) {
         LinkedList<String> states = new LinkedList<>();
         for (SearchNode trace = node; trace != null; trace = trace.parent) {
@@ -379,7 +382,7 @@ public class Routenplaner {
         for (int i = 1; i < chain.size(); i++) {
             SearchNode fromNode = chain.get(i - 1);
             SearchNode toNode = chain.get(i);
-            String formatted = String.format(Locale.US, "%02d. %-12s %-25s -> %-25s %6.2f Min.",
+            String formatted = String.format(Locale.US, "%02d. %-12s %-25s -> %-25s %6.2f min",
                     stepNumber++, toNode.actionTaken, fromNode.state, toNode.state, toNode.stepCost);
             steps.add(formatted);
         }
@@ -388,55 +391,86 @@ public class Routenplaner {
 
     public static void displayReport(String title, SearchResult report) {
         System.out.println("\n=======================================================");
-        System.out.println("EXPERIMENT: " + title);
-        System.out.printf(Locale.US, "Start: (%.6f, %.6f) | Ziel: (%.6f, %.6f)%n",
+        System.out.println("SCENARIO: " + title);
+        System.out.printf(Locale.US, "Start: (%.6f, %.6f) | Destination: (%.6f, %.6f)%n",
                 report.startCoord.lat, report.startCoord.lon, report.targetCoord.lat, report.targetCoord.lon);
         if (report.startFallback) {
-            System.out.printf(Locale.US, "Hinweis: Keine U-Bahn-Station innerhalb von %.0f Min. Fussweg vom Start, "
-                    + "Fussweg zu den %d naechsten Stationen erlaubt%n", report.maxWalkToStationMin, FALLBACK_STATIONS);
+            System.out.printf(Locale.US, "Note: no U-Bahn station within %.0f min walk of the start, "
+                    + "walking to the %d nearest stations allowed%n", report.maxWalkToStationMin, FALLBACK_STATIONS);
         }
         if (report.targetFallback) {
-            System.out.printf(Locale.US, "Hinweis: Keine U-Bahn-Station innerhalb von %.0f Min. Fussweg vom Ziel, "
-                    + "Fussweg von den %d naechsten Stationen erlaubt%n", report.maxWalkToStationMin, FALLBACK_STATIONS);
+            System.out.printf(Locale.US, "Note: no U-Bahn station within %.0f min walk of the destination, "
+                    + "walking from the %d nearest stations allowed%n", report.maxWalkToStationMin, FALLBACK_STATIONS);
         }
         System.out.println("Status: " + report.statusMessage);
 
         if (report.pathDetails.isEmpty()) {
-            System.out.println("-> Keine Route gefunden.");
+            System.out.println("-> No route found.");
             if (report.hitDepthLimit) {
-                System.out.println("-> mit der maximalen Pfadlänge kann eine Lösung nicht generiert werden");
+                System.out.println("-> no solution can be generated within the maximum path length");
             }
         } else {
             for (String step : report.pathDetails) {
                 System.out.println("  " + step);
             }
-            System.out.printf(Locale.US, "Gesamtdauer: %.2f minuten | Pfadlaenge: %d%n",
+            System.out.printf(Locale.US, "Total time: %.2f min | Path length: %d%n",
                     report.totalTimeMinutes, report.pathDetails.size());
         }
-        System.out.println("Untersuchte Zustaende: " + report.exploredStatesCount);
-        System.out.println("Maximale OPEN-Grösse: " + report.maxQueueSize);
-        System.out.println("p_max-Limit erreicht: " + report.hitDepthLimit);
-        System.out.println("Zeitlimit erreicht : " + report.hitTimeLimit);
+        System.out.println("Expanded states   : " + report.exploredStatesCount);
+        System.out.println("Max. OPEN size    : " + report.maxQueueSize);
+        System.out.println("p_max limit hit   : " + report.hitDepthLimit);
+        System.out.println("Time limit hit    : " + report.hitTimeLimit);
         System.out.println("=======================================================");
     }
 
     private static void printUsage() {
-        System.out.println("Aufruf: java Routenplaner [-v] [startLat startLon zielLat zielLon [p_max] [zeitlimitSek]]");
-        System.out.println("Ohne Koordinaten werden die Experimente A-F ausgefuehrt.");
-        System.out.println("-v: jeden untersuchten Pfad mit f, g und depth ausgeben");
+        System.out.println("Usage: java RoutePlanner [-v] [--compare] [startLat startLon destLat destLon [p_max] [timeoutSec]]");
+        System.out.println("Without coordinates the demo scenarios A-F are run.");
+        System.out.println("-v:        print every expanded path with f, g and depth");
+        System.out.println("--compare: compare A* against uniform-cost search (h = 0)");
     }
 
-    //Fuehrt ein Experiment aus und gibt das Ergebnis aus
-    private void runExperiment(String title, Coordinate start, Coordinate target, int pMax, double timeoutSeconds) {
+    // Runs one scenario and prints the result
+    private void runScenario(String title, Coordinate start, Coordinate target, int pMax, double timeoutSeconds) {
         if (verbose) {
-            System.out.println("\n--- Untersuchte Pfade: " + title + " ---");
+            System.out.println("\n--- Expanded paths: " + title + " ---");
         }
         displayReport(title, findRoute(start, target, pMax, timeoutSeconds, MAX_WALK_TO_STATION_MIN, MAX_DIRECT_WALK_MIN));
     }
 
+    // Runs the same query with and without the heuristic and prints one table row
+    private void compareRow(String title, Coordinate start, Coordinate target) {
+        useHeuristic = true;
+        SearchResult aStar = findRoute(start, target, DEFAULT_P_MAX, DEFAULT_TIMEOUT_S, MAX_WALK_TO_STATION_MIN, MAX_DIRECT_WALK_MIN);
+        useHeuristic = false;
+        SearchResult ucs = findRoute(start, target, DEFAULT_P_MAX, DEFAULT_TIMEOUT_S, MAX_WALK_TO_STATION_MIN, MAX_DIRECT_WALK_MIN);
+        useHeuristic = true;
+        System.out.printf(Locale.US, "%-38s %8.2f %8.2f %9d %9d %7.0f%%%n", title,
+                aStar.totalTimeMinutes, ucs.totalTimeMinutes, aStar.exploredStatesCount, ucs.exploredStatesCount,
+                100.0 * (1.0 - (double) aStar.exploredStatesCount / ucs.exploredStatesCount));
+    }
+
+    private void runComparison() {
+        System.out.println("\nA* (straight-line heuristic) vs. uniform-cost search (h = 0)");
+        System.out.printf(Locale.US, "%-38s %8s %8s %9s %9s %8s%n",
+                "Route", "A* min", "UCS min", "A* exp.", "UCS exp.", "saved");
+        compareRow("Alexanderplatz -> Prenzlauer Berg",
+                new Coordinate(52.5213, 13.4114), new Coordinate(52.5270, 13.4196));
+        compareRow("Möckernbrücke -> Friedrichshain",
+                new Coordinate(52.499167, 13.382778), new Coordinate(52.510000, 13.445000));
+        compareRow("Alexanderplatz -> Rathaus Neukölln",
+                new Coordinate(52.521389, 13.411944), new Coordinate(52.481667, 13.434167));
+        compareRow("Siemensdamm -> Hermannplatz",
+                new Coordinate(52.536667, 13.273056), new Coordinate(52.486389, 13.424444));
+        compareRow("Rathaus Spandau -> Rudow",
+                new Coordinate(52.5350, 13.2003), new Coordinate(52.4158, 13.4961));
+        compareRow("Hönow -> Rathaus Spandau",
+                new Coordinate(52.5383, 13.6339), new Coordinate(52.535, 13.200278));
+    }
+
     public static void main(String[] args) {
         try {
-            //Umlaute: unter Windows Codepage der Konsole, sonst UTF-8
+            // Umlauts: use the console code page on Windows, UTF-8 otherwise
             String consoleEncoding = System.getProperty("sun.stdout.encoding");
             String outputEncoding = "UTF-8";
             if (consoleEncoding != null && !consoleEncoding.equalsIgnoreCase("cp65001") && Charset.isSupported(consoleEncoding)) {
@@ -444,20 +478,21 @@ public class Routenplaner {
             }
             System.setOut(new PrintStream(new FileOutputStream(FileDescriptor.out), true, outputEncoding));
 
-            Path csvPath = Paths.get("src/A1-GKI-WS26-berliner_ubahn_geokoordinaten.csv");
-            if (!Files.exists(csvPath)) {
-                csvPath = Paths.get("A1-GKI-WS26-berliner_ubahn_geokoordinaten.csv");
-            }
+            RoutePlanner planner = new RoutePlanner(Paths.get(DATA_FILE));
+            System.out.printf(Locale.US, "Network loaded. Fastest U-Bahn speed: %.2f km/h%n", planner.maximumMetroSpeed);
 
-            Routenplaner planner = new Routenplaner(csvPath);
-            System.out.printf(Locale.US, "System gestartet. Maximale U-Bahn Geschwindigkeit: %.2f km/h%n", planner.maximumMetroSpeed);
-
-            // Option -v aus den Argumenten entfernen
+            // Strip flags from the arguments
             List<String> argList = new ArrayList<>(Arrays.asList(args));
             planner.verbose = argList.remove("-v");
+            boolean compare = argList.remove("--compare");
             args = argList.toArray(new String[0]);
 
-            // Eigene Koordinaten ueber die Kommandozeile
+            if (compare) {
+                planner.runComparison();
+                return;
+            }
+
+            // Custom coordinates from the command line
             if (args.length > 0) {
                 if (args.length != 4 && args.length != 5 && args.length != 6) {
                     printUsage();
@@ -473,37 +508,37 @@ public class Routenplaner {
                     if (args.length >= 5) pMax = Integer.parseInt(args[4].trim());
                     if (args.length == 6) timeout = parseDecimal(args[5]);
                 } catch (NumberFormatException ex) {
-                    System.out.println("Ungueltige Zahl: " + ex.getMessage());
+                    System.out.println("Invalid number: " + ex.getMessage());
                     printUsage();
                     return;
                 }
-                planner.runExperiment(String.format(Locale.US, "Eigene Route (p_max = %d)", pMax),
+                planner.runScenario(String.format(Locale.US, "Custom route (p_max = %d)", pMax),
                         start, target, pMax, timeout);
                 return;
             }
 
-            // EXP A
-            planner.runExperiment("Exp A: Alexanderplatz -> Mendelssohnstraße (Prenzlauer Berg) (am schnellsten zu Fuss)",
+            // A: walking is fastest, but A* still explores some U-Bahn paths
+            planner.runScenario("A: Alexanderplatz -> Prenzlauer Berg (walking is fastest)",
                     new Coordinate(52.5213, 13.4114), new Coordinate(52.5270, 13.4196), DEFAULT_P_MAX, DEFAULT_TIMEOUT_S);
 
-            // EXP B
-            planner.runExperiment("Exp B: Möckernbrücke -> Schnitzery Friedrichshain (U-Bahn ohne Umsteigen + zu Fuss Gehen)",
+            // B: single ride without transfer
+            planner.runScenario("B: Möckernbrücke -> Friedrichshain (one line, no transfer)",
                     new Coordinate(52.499167, 13.382778), new Coordinate(52.510000, 13.445000), DEFAULT_P_MAX, DEFAULT_TIMEOUT_S);
 
-            // EXP C
-            planner.runExperiment("Exp C: Alexanderplatz -> Rathaus Neukölln (Reise mit Umsteigen)",
+            // C: route with one transfer
+            planner.runScenario("C: Alexanderplatz -> Rathaus Neukölln (one transfer)",
                     new Coordinate(52.521389, 13.411944), new Coordinate(52.481667, 13.434167), DEFAULT_P_MAX, DEFAULT_TIMEOUT_S);
 
-            // EXP D
-            planner.runExperiment("Exp D: Rathaus Spandau -> Rudow (p_max = 40, potenziell nicht optimal)",
+            // D: depth limit cuts off paths, solution may not be optimal
+            planner.runScenario("D: Rathaus Spandau -> Rudow (p_max = 40, potentially non-optimal)",
                     new Coordinate(52.5350, 13.2003), new Coordinate(52.4158, 13.4961), 40, DEFAULT_TIMEOUT_S);
 
-            // EXP E
-            planner.runExperiment("Exp E: Hönow -> Rathaus Spandau (p_max = 40, keine Lösung)",
+            // E: depth limit too small for any solution
+            planner.runScenario("E: Hönow -> Rathaus Spandau (p_max = 40, no solution)",
                     new Coordinate(52.5383, 13.6339), new Coordinate(52.535, 13.200278), 40, DEFAULT_TIMEOUT_S);
 
-            // EXP F
-            planner.runExperiment("Exp F: Siemensdamm -> Hermannplatz (Zeitlimit 0.0001 s, ohne Erfolg)",
+            // F: time limit hit before a solution is found
+            planner.runScenario("F: Siemensdamm -> Hermannplatz (time limit 0.0001 s, no result)",
                     new Coordinate(52.536667, 13.273056), new Coordinate(52.486389, 13.424444), DEFAULT_P_MAX, 0.0001);
 
         } catch (Exception ex) {
